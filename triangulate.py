@@ -11,6 +11,8 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
+################################################################################
+# Classes
 
 class World:
 
@@ -87,7 +89,51 @@ class Scenario:
                     for k in range(len(self.world.sensor_locs))
                 )
         
-        return loc_map
+        return Solution(self.world, self, loc_map, search_x, search_y)
+
+
+class Solution:
+
+    def __init__(self, world, scenario, solution_map, search_x, search_y):
+        self.world = world
+        self.scenario = scenario
+        self.solution_map = solution_map
+        self.search_x = search_x
+        self.search_y = search_y
+
+        self._ref_sensor_idx = None
+        self._best_loc = None
+        self._best_dist = None
+        self._best_event_time = None
+    
+
+    def ref_sensor_idx(self):
+        # Sensor with the smallest TOA is the reference sensor
+        if self._ref_sensor_idx is None:
+            self._ref_sensor_idx = self.scenario.toas.index(min(self.scenario.toas))
+        return self._ref_sensor_idx
+
+
+    def best_loc(self):
+        if self._best_loc is None:
+            best_loc = self.solution_map.argmin()     # Index
+            self._best_loc = np.array([               # Convert index to (x, y) pair
+                self.search_x[best_loc % self.solution_map.shape[1]],
+                self.search_y[best_loc // self.solution_map.shape[1]], 
+            ])
+        return self._best_loc
+    
+    def best_dist(self):
+        if self._best_dist is None:
+            self._best_dist = np.linalg.norm(
+                self.best_loc() - self.world.sensor_locs[ self.ref_sensor_idx() ]
+            )
+        return self._best_dist
+
+    def best_event_time(self):
+        if self._best_event_time is None:
+            self._best_event_time = self.scenario.toas[ self.ref_sensor_idx() ] - self.best_dist() / self.world.wave_speed
+        return self._best_event_time
 
 
 class MapImage:
@@ -113,6 +159,33 @@ class MapImage:
             **kwargs, 
         )
 
+################################################################################
+# Functions
+
+def print_solution_info(solution):
+    
+    best_time_to_ref = solution.best_dist() / solution.world.wave_speed
+
+    print("Best location estimate: {}".format(solution.best_loc()))
+    print("Estimated event time: {}".format(solution.best_event_time()))
+
+    for i in range(len(solution.world.sensor_locs)):
+
+        # Time from best-scoring location to this sensor
+        time_to_sensor = np.linalg.norm(solution.best_loc() - solution.world.sensor_locs[i]) / solution.world.wave_speed
+
+        # Difference in detection time between reference sensor and this 
+        # sensor, assuming the event happened at the best-scoring location
+        time_difference_to_sensor = time_to_sensor - best_time_to_ref
+
+        print("[Sensor {}] TOA: {} (Truth: {}), TDOA: {} (Truth: {})".format(
+            i, 
+            solution.best_event_time() + time_to_sensor, 
+            solution.scenario.toas[i], 
+            time_difference_to_sensor, 
+            solution.scenario.toas[i] - solution.scenario.toas[solution.ref_sensor_idx()], 
+        ))
+
 
 def draw_map(ax, img, a_img, b_img, a_ax, b_ax, **kwargs):
     # Draws an image on a matplotlib axis, with the image extent set such that 
@@ -137,12 +210,9 @@ def draw_map(ax, img, a_img, b_img, a_ax, b_ax, **kwargs):
     )
 
 
-def main(
+def plot_solution(
             ax, 
-            world, 
-            scenario, 
-            search_x,               # list of regularly-spaced x values to search over
-            search_y,               # list of regularly-spaced y values to search over
+            solution, 
             map_images=[],          # list of MapImage objects to draw
             solution_cmap=None,     # colormap to use for plotting solution
             toa_circles={},         # TOA circles centered at sensors: a dict of Circle() kwargs, or False to disable
@@ -150,72 +220,22 @@ def main(
             plot_sensors={},        # Sensor points: a dict of plot() kwargs, or False to disable
             annotate_sensors={},    # Sensor annotations: a dict of annotate() kwargs, or False to disable
             plot_best={},           # Best solution point: a dict of plot() kwargs, or False to disable
-            print_results=True, 
-            print_timing=5,         # Print timing information every N seconds, or False to disable
         ):
-
-    # We assume search_x and search_y lists are regularly-spaced
-    search_x_diff = search_x[1] - search_x[0]
-    search_y_diff = search_y[1] - search_y[0]
-
-    # Solve the scenario
-    loc_map = scenario.solve(
-        search_x, 
-        search_y, 
-        print_timing=print_timing, 
-    )
-    
-    # Sensor with the smallest TOA is the reference sensor
-    ref_sensor_idx = scenario.toas.index(min(scenario.toas))
-
-    # Best-scoring location
-    best_loc = loc_map.argmin()     # Index
-    best_loc = np.array([           # Convert index to (x, y) pair
-        search_x[best_loc % loc_map.shape[1]],
-        search_y[best_loc // loc_map.shape[1]], 
-    ])
-
-    # Distance from the best-scoring location to the reference sensor
-    best_dist_to_ref = np.linalg.norm(best_loc - world.sensor_locs[ref_sensor_idx])
-    best_time_to_ref = best_dist_to_ref / world.wave_speed
-
-    # Best approximation for the time of the event
-    best_event_time = toas[ref_sensor_idx] - best_time_to_ref
-
-    if print_results:
-
-        print("Best location estimate: {}".format(best_loc))
-        print("Estimated event time: {}".format(best_event_time))
-
-        for i in range(len(world.sensor_locs)):
-
-            # Time from best-scoring location to this sensor
-            time_to_sensor = np.linalg.norm(best_loc - world.sensor_locs[i]) / world.wave_speed
-
-            # Difference in detection time between reference sensor and this 
-            # sensor, assuming the event happened at the best-scoring location
-            time_difference_to_sensor = time_to_sensor - best_time_to_ref
-
-            print("[Sensor {}] TOA: {} (Truth: {}), TDOA: {} (Truth: {})".format(
-                i, 
-                best_event_time + time_to_sensor, 
-                scenario.toas[i], 
-                time_difference_to_sensor, 
-                scenario.toas[i] - scenario.toas[ref_sensor_idx], 
-            ))
-
-    # Plot results
 
     for map_img in map_images:
         map_img.draw(ax)
 
+    # We assume search_x and search_y lists are regularly-spaced
+    search_x_diff = solution.search_x[1] - solution.search_x[0]
+    search_y_diff = solution.search_y[1] - solution.search_y[0]
+
     ax.imshow(
-        loc_map, 
+        solution.solution_map, 
         extent=[
-            search_x.min() - 0.5*search_x_diff, 
-            search_x.max() + 0.5*search_x_diff, 
-            search_y.min() - 0.5*search_y_diff, 
-            search_y.max() + 0.5*search_y_diff, 
+            solution.search_x.min() - 0.5*search_x_diff, 
+            solution.search_x.max() + 0.5*search_x_diff, 
+            solution.search_y.min() - 0.5*search_y_diff, 
+            solution.search_y.max() + 0.5*search_y_diff, 
         ], 
         interpolation="nearest", 
         cmap=solution_cmap, 
@@ -231,9 +251,9 @@ def main(
         }
         circle_dict.update(toa_circles)
         
-        for i, (loc, t) in enumerate(zip(sensor_locs, toas)):
+        for i, (loc, t) in enumerate(zip(solution.world.sensor_locs, solution.scenario.toas)):
             ax.add_artist(
-                plt.Circle( loc, (t-best_event_time)*world.wave_speed, **circle_dict)
+                plt.Circle( loc, (t-solution.best_event_time())*solution.world.wave_speed, **circle_dict)
             )
 
     # Plot TOA circles from estimated location
@@ -244,9 +264,9 @@ def main(
         }
         circle_dict.update(toa_circles_best)
         
-        for i, (loc, t) in enumerate(zip(sensor_locs, toas)):
+        for i, (loc, t) in enumerate(zip(solution.world.sensor_locs, solution.scenario.toas)):
             ax.add_artist(
-                plt.Circle( best_loc, (t-best_event_time)*world.wave_speed, **circle_dict)
+                plt.Circle( solution.best_loc(), (t-solution.best_event_time())*solution.world.wave_speed, **circle_dict)
             )
 
     # Plot sensor points
@@ -257,12 +277,12 @@ def main(
         }
         sensor_dict.update(plot_sensors)
 
-        for loc in sensor_locs:
+        for loc in solution.world.sensor_locs:
             ax.plot(loc[0], loc[1], **sensor_dict)
 
     # Annotate sensors
     if annotate_sensors is not False:
-        for i, loc in enumerate(sensor_locs):
+        for i, loc in enumerate(solution.world.sensor_locs):
             ax.annotate(str(i), loc, **annotate_sensors)
 
     # Plot estimated location
@@ -272,9 +292,39 @@ def main(
             "color" : "k", 
         }
         best_dict.update(plot_best)
-        plt.plot(best_loc[0], best_loc[1], **best_dict)
+        plt.plot(solution.best_loc()[0], solution.best_loc()[1], **best_dict)
 
 
+def main(
+            ax, 
+            scenario, 
+            search_x,               # list of regularly-spaced x values to search over
+            search_y,               # list of regularly-spaced y values to search over
+            map_images=[],          # list of MapImage objects to draw
+            solution_cmap=None,     # colormap to use for plotting solution
+            toa_circles={},         # TOA circles centered at sensors: a dict of Circle() kwargs, or False to disable
+            toa_circles_best={},    # TOA circles centered at best solution: a dict of Circle() kwargs, or False to disable
+            plot_sensors={},        # Sensor points: a dict of plot() kwargs, or False to disable
+            annotate_sensors={},    # Sensor annotations: a dict of annotate() kwargs, or False to disable
+            plot_best={},           # Best solution point: a dict of plot() kwargs, or False to disable
+            print_results=True, 
+            print_timing=5,         # Print timing information every N seconds, or False to disable
+        ):
+
+    # Solve the scenario
+    solution = scenario.solve(
+        search_x, 
+        search_y, 
+        print_timing=print_timing, 
+    )
+    
+    if print_results:
+        print_solution_info(solution)
+
+    # Plot results
+    plot_solution(ax, solution, map_images, solution_cmap, toa_circles, toa_circles_best, plot_sensors, annotate_sensors, plot_best)
+
+################################################################################
 ################################################################################
 
 if __name__ == "__main__":
@@ -328,7 +378,6 @@ if __name__ == "__main__":
 
             main(
                 ax, 
-                world, 
                 offset_scenario, 
                 search_x, 
                 search_y, 
