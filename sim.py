@@ -247,7 +247,7 @@ class SimpleSensorController:
 
 
 class SimpleFirstShotDetector:
-    def __init__(self, basic_snr=2.5):
+    def __init__(self, basic_snr=1.5):
         self.basic_snr = basic_snr
         self.abs_buffer_values = []
         self.buffer_abs_argmaxes = []
@@ -333,6 +333,36 @@ class SimpleCorrelator:
         return offsets
 
 
+class SimpleFarFieldDirectionFinder:
+    def __init__(self, sensor_controller):
+        self.sensor_controller = sensor_controller
+    
+    def find_direction(self, time_offsets, ref_ind):
+        angles = np.zeros(len(time_offsets))
+        ref_sensor = self.sensor_controller.sensors[ref_ind]
+        for i, time_offset in enumerate(time_offsets):
+            if i != ref_ind:
+                sensor = self.sensor_controller.sensors[i]
+                sensor_pos_diff = sensor.position - ref_sensor.position
+
+                sensor_angle = np.arctan2(sensor_pos_diff[1], sensor_pos_diff[0])
+                
+                sensor_dist = np.linalg.norm(sensor_pos_diff)
+                tdoa_angle = np.arccos(time_offset * ref_sensor.world.wave_speed / sensor_dist)
+
+                angles[i] = np.rad2deg(sensor_angle + tdoa_angle)
+            else:
+                angles[i] = np.nan
+        
+        angles += 360.0
+        angles_mean = np.nanmean(angles)
+        angles_std = np.nanstd(angles)
+        if angles_mean > 180.0:
+            angles_mean -= 360.0
+        
+        return angles_mean, angles_std
+
+
 def plot_buffers(
             ax, buffers, 
             plot_args=("o-",), plot_kwargs={}, 
@@ -384,7 +414,7 @@ def main():
     world = World(
         wave_speed=1114.0, 
         # background_noise_model=GaussianNoiseModel(0.0, 0.0), 
-        background_noise_model=GaussianNoiseModel(0.0, 0.00005), 
+        background_noise_model=GaussianNoiseModel(0.0, 0.000001), 
         decay_model=R3DecayModel(), 
         events=events, 
     )
@@ -392,7 +422,7 @@ def main():
     sensor_noise = GaussianNoiseModel(0.0, 0.0)
     # sensor_noise = GaussianNoiseModel(0.0, 0.00000005)
 
-    digital_resolution = 16
+    digital_resolution = 1024
     adc = AnalogToDigitalConverter(-0.001, 0.001, digital_resolution)
     dac = DigitalToAnalogConverter(-0.001, 0.001, digital_resolution)
     sensor_converters = [adc, dac]
@@ -454,12 +484,18 @@ def main():
         shot_detector=SimpleFirstShotDetector(), 
     )
 
+    direction_finder = SimpleFarFieldDirectionFinder(controller)
+
     sim_time = 2.3
 
     while controller._time < sim_time:
         controller.update_buffers()
         offsets = correlator.get_buffer_offsets(controller.get_buffers())
-        print(offsets)
+        print("Time offsets (seconds): {}".format(offsets))
+
+        if offsets is not None:
+            angle, angle_std = direction_finder.find_direction(offsets, correlator.first_buffer_ind)
+            print("Detected shot at {:.03f} deg (std: {:0.3g})".format(angle, angle_std))
         
         fig, ax = plt.subplots()
         plot_buffers(ax, correlator.buffers)
