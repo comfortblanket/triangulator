@@ -1,6 +1,5 @@
 import matplotlib.pyplot as plt
 import numpy as np
-import scipy.signal
 
 
 class GaussianNoiseModel:
@@ -88,6 +87,9 @@ class SensorMeasurement:
         self.time = time
         self.value = value
         self.sensor = sensor
+    
+    def copy(self):
+        return SensorMeasurement(self.position, self.time, self.value, self.sensor)
 
 
 class Sensor:
@@ -108,29 +110,80 @@ class Sensor:
 
 
 class AnalogToDigitalConverter:
-    def __init__(self, analog_min, analog_max, digital_scale=1024):
+    def __init__(self, analog_min, analog_max, digital_resolution=1024):
         self.analog_min = analog_min
         self.analog_max = analog_max
-        self.digital_scale = digital_scale
+        self.digital_resolution = digital_resolution
     
     def convert(self, value):
         # Returns the digitized value of the given value
-        digitized_value = (value - self.analog_min) / (self.analog_max - self.analog_min) * self.digital_scale
+        digitized_value = (value - self.analog_min) / (self.analog_max - self.analog_min) * self.digital_resolution
         digitized_value = int(digitized_value)
-        digitized_value = max(0, min(self.digital_scale, digitized_value))
+        digitized_value = max(0, min(self.digital_resolution, digitized_value))
         return digitized_value
 
 
 class DigitalToAnalogConverter:
-    def __init__(self, analog_min, analog_max, digital_scale=1024):
+    def __init__(self, analog_min, analog_max, digital_resolution=1024):
         self.analog_min = analog_min
         self.analog_max = analog_max
-        self.digital_scale = digital_scale
+        self.digital_resolution = digital_resolution
     
     def convert(self, value):
         # Returns the analog value of the given digitized value
-        analog_value = value * (self.analog_max - self.analog_min) / self.digital_scale + self.analog_min
+        analog_value = value * (self.analog_max - self.analog_min) / self.digital_resolution + self.analog_min
         return analog_value
+
+
+class TimeDataBuffer:
+    def __init__(self, times, values, sample_rate=None, original_measurements=None):
+        try:
+            assert len(times) == len(values)
+        except TypeError:
+            times = np.arange(times, times + len(values) * sample_rate, sample_rate)
+        
+        self.times = times
+        self.values = values
+
+        self.sample_rate = sample_rate
+        if sample_rate is None:
+            sample_rate = times[1] - times[0]
+        assert np.allclose(np.diff(times), sample_rate), "Times must be evenly spaced at the given sample rate"
+
+        self.orig_meas = original_measurements
+    
+    def copy(self, times=None, values=None, sample_rate=None, orig_meas=None):
+        if times is None:
+            times = self.times.copy()
+        
+        if values is None:
+            values = self.values.copy()
+        
+        if sample_rate is None:
+            sample_rate = self.sample_rate
+        
+        if orig_meas is None and self.orig_meas is not None:
+            orig_meas = [meas.copy() for meas in self.orig_meas]
+        
+        return TimeDataBuffer(times, values, sample_rate, orig_meas)
+
+    @classmethod
+    def from_measurements(cls, measurements, sample_rate=None):
+        times = np.array([measurement.time for measurement in measurements])
+        values = np.array([measurement.value for measurement in measurements])
+        return cls(times, values, sample_rate, measurements)
+    
+    def __getitem__(self, index):
+        return SensorMeasurement(
+            None if self.orig_meas is None else self.orig_meas[index].position, 
+            self.times[index], 
+            self.values[index], 
+            None if self.orig_meas is None else self.orig_meas[index].sensor, 
+        )
+    
+    def __len__(self):
+        return len(self.times)
+
 
 
 class SimpleSensorController:
@@ -179,135 +232,140 @@ class SimpleSensorController:
         
         self.increment_time(self.inter_buffer_time)
         self.reset_sensor_ind()
+    
+    def get_effective_sample_rate(self):
+        return self.sample_rate * len(self.sensors)
+    
+    def get_buffers(self):
+        return [
+            TimeDataBuffer.from_measurements(
+                buffer, 
+                self.get_effective_sample_rate(), 
+            ) 
+            for buffer in self.buffers
+        ]
+
+
+class SimpleFirstShotDetector:
+    def __init__(self, basic_snr=2.5):
+        self.basic_snr = basic_snr
+        self.abs_buffer_values = []
+        self.buffer_abs_argmaxes = []
+        self.buffer_abs_maxes = []
+        self.buffer_abs_medians = []
+    
+    def detect(self, buffers):
+        self.abs_buffer_values = [
+            np.abs(buffer.values) 
+            for buffer in buffers
+        ]
+        self.buffer_abs_argmaxes = [
+            np.argmax(abs_buffer_values) 
+            for abs_buffer_values in self.abs_buffer_values
+        ]
+        self.buffer_abs_maxes = [
+            abs_buffer_values[abs_argmax] 
+            for abs_buffer_values, abs_argmax 
+            in zip(self.abs_buffer_values, self.buffer_abs_argmaxes)
+        ]
+        self.buffer_abs_medians = [
+            np.median(abs_buffer_values) 
+            for abs_buffer_values in self.abs_buffer_values
+        ]
+        return all([
+            abs_max > self.basic_snr * abs_median
+            for abs_max, abs_median
+            in zip(self.buffer_abs_maxes, self.buffer_abs_medians)
+        ])
+
+
+def normalize(data, largest_result=100.0, data_abs_max=None):
+
+    if data_abs_max is None:
+        abs_data = np.abs(data)
+        data_abs_max = np.max(abs_data)
+    
+    data = data * (largest_result / data_abs_max)
+
+    return data
 
 
 class SimpleCorrelator:
-    def __init__(self, sample_rate):
+    def __init__(self, sample_rate, shot_detector):
         self.sample_rate = sample_rate
+        self.shot_detector = shot_detector
 
-        self.clean_buffer_times = []
-        self.clean_buffers = []
-        self.buffer_maxes = []
+        self.buffers = []
+        self.max_times = []
         self.first_buffer_ind = None
 
-    def get_buffer_offsets(self, buffers, k=51):
+    def get_buffer_offsets(self, time_data_buffers):
 
-        self.clean_buffers = [
-            normalize(np.array([meas.value for meas in buffer])) 
-            for buffer in buffers
+        self.buffers = time_data_buffers
+        
+        if not self.shot_detector.detect(self.buffers):
+            return None
+        
+        self.buffers = [
+            buffer.copy(values=normalize(buffer.values, data_abs_max=buffer_abs_max))
+            for buffer, buffer_abs_max in zip(self.buffers, self.shot_detector.buffer_abs_maxes)
         ]
 
-        self.clean_buffer_times, self.clean_buffers = upsample_signals(
-            [ [meas.time for meas in buffer] for buffer in buffers ], 
-            [ np.array([meas.value for meas in buffer]) for buffer in buffers ], 
-        )
-        self.clean_buffers = [
-            normalize(buffer)
-            for buffer in self.clean_buffers
-        ]
-
-        # abs_buffers = np.array([
-        #     np.abs(buffer) 
-        #     for buffer in self.clean_buffers
-        # ])
-
-        # Find position of the largest absolute sample in each buffer
-        # k_largest_inds = np.array([
-        #     np.argpartition(buffer, -k)[-k:]
-        #     for buffer in abs_buffers
-        # ])
-        # k_largest = np.array([
-        #     buffer[k_largest_inds[i]] 
-        #     for i, buffer in enumerate(abs_buffers)
-        # ])
-        # self.buffer_maxes = np.array([
-        #     np.average(largest_inds, weights=largest/np.sum(largest)) 
-        #     for largest, largest_inds in zip(k_largest, k_largest_inds)
-        # ], dtype=int)
-        self.buffer_maxes = np.array([
-            np.argmax( np.abs(buffer) ) 
-            for buffer in self.clean_buffers
+        # Find the time of the max value in each buffer
+        self.max_inds = self.shot_detector.buffer_abs_argmaxes
+        self.max_times = np.array([
+            buffer.times[max_ind] 
+            for buffer, max_ind in zip(self.buffers, self.max_inds)
         ])
 
         # Find the buffer with the first maximum
-        self.first_buffer_ind = np.argmin(self.buffer_maxes)
-        first_buffer = self.clean_buffers[self.first_buffer_ind]
+        self.first_buffer_ind = np.argmin(self.max_times)
+        first_buffer = self.buffers[self.first_buffer_ind]
 
-        # Find the offsets of the other buffers relative to the first buffer 
+        # Find the offsets of the other buffers relative to the 'first' buffer 
         # by cross-correlating them
-        offsets = np.zeros(len(self.clean_buffers))
-        for i, buffer in enumerate(self.clean_buffers):
+        offsets = np.zeros(len(self.buffers))
+        for i, buffer in enumerate(self.buffers):
             if i != self.first_buffer_ind:    
-                correlation = np.correlate(buffer, first_buffer, mode="full").argmax()
-                offsets[i] = (self.sample_rate / len(self.clean_buffers)) * (correlation - len(buffer))
+                best_ind = np.correlate(buffer.values, first_buffer.values, mode="full").argmax()
+                offsets[i] = (buffer.sample_rate / len(self.buffers)) * (best_ind - len(buffer))
         
         return offsets
 
 
-def upsample_simultaneous_signals(signals):
-    # signals contains a list of signals which were created by sampling first 
-    # the first one, then the second one, etc, and then repeating. This 
-    # function slides each signal so that they are all aligned at the first 
-    # value, upsamples each by the number of signals in the list, and then 
-    # removes the extra values at the ends of each signal.
-
-    new_signals = []
-    for i, signal in enumerate(signals):
-        # resampled_signal = scipy.signal.resample(signal, len(signal) * len(signals))#, window="hamming")
-        
-        N = len(signal)
-        interp = len(signals)
-        resampled_signal = scipy.fft.ifft(N*scipy.fft.fft(signal), interp*N)
-
-        # resampled_signal = resampled_signal[i:i+len(resampled_signal)-len(signals)+1:]
-        new_signals.append(resampled_signal)
-    return new_signals
+def plot_buffers(
+            ax, buffers, 
+            plot_args=("o-",), plot_kwargs={}, 
+        ):
+    handles = []
+    for buffer in buffers:
+        handle, = ax.plot(buffer.times, buffer.values, *plot_args, **plot_kwargs)
+        handles.append(handle)
+    return handles
 
 
-def upsample_signals(times, signals):
-    resampled_times = []
-    for time_buffer in times:
-        resampled_times += time_buffer
-    resampled_times = sorted( resampled_times )[len(times)-1:]
-
-    resampled_buffers = upsample_simultaneous_signals(signals)
-
-    return resampled_times, resampled_buffers
-
-
-def reconstruct_signals(signals):
-    reconstructed_signals = [
-        scipy.signal
-    ]
-
-    return reconstructed_signals
-
-
-def plot_clean_buffers(buffer_times, buffers, maxes=None, offsets=None, first_offset_ind=None):
-    if maxes is None:
-        for times, buffer in zip(buffer_times, buffers):
-            plt.plot(times, buffer, "o-")
-
-    elif offsets is None:
-        for buffer, mx in zip(buffers, maxes):
-            plt.plot(buffer_times, buffer, "o-")
-            # plt.axvline(x=buffer_times[mx].time, color="r")
-        
-    else:
-        ref_buf_time = buffer_times[maxes[first_offset_ind]]
-        i = 0
-        for buffer, mx, offset in zip(buffers, maxes, offsets):
-            plt.plot(buffer_times, buffer, "o-", label=f"Sensor {i}")
-            # plt.axvline(x=buffer_times[mx], color="orange", lw=3)
-            plt.axvline(x=ref_buf_time + offset, color="g", lw=1)
-            i += 1
+def plot_buffer_maxes(
+            ax, max_times, 
+            axvline_args=(), axvline_kwargs={"color":"r"}, 
+        ):
     
-        plt.legend()
+    handles = []
+    for max_time in max_times:
+        handle = ax.axvline(x=max_time, *axvline_args, **axvline_kwargs)
+        handles.append(handle)
+    return handles
 
 
-def normalize(data):
+def plot_buffer_offsets(
+            ax, ref_time, time_offsets, 
+            axvline_args=(), axvline_kwargs={"color":"g"}, 
+        ):
     
-    return data - np.mean(data)
+    handles = []
+    for time_offset in time_offsets:
+        handle = ax.axvline(x=ref_time + time_offset, *axvline_args, **axvline_kwargs)
+        handles.append(handle)
+    return handles
 
 
 def main():
@@ -325,17 +383,19 @@ def main():
 
     world = World(
         wave_speed=1114.0, 
-        background_noise_model=GaussianNoiseModel(0.0, 0.0), 
-        # background_noise_model=GaussianNoiseModel(0.0, 0.000001), 
+        # background_noise_model=GaussianNoiseModel(0.0, 0.0), 
+        background_noise_model=GaussianNoiseModel(0.0, 0.00005), 
         decay_model=R3DecayModel(), 
         events=events, 
     )
 
-    sensor_noise = GaussianNoiseModel(0.0, 0.0)#0.00000001)
+    sensor_noise = GaussianNoiseModel(0.0, 0.0)
+    # sensor_noise = GaussianNoiseModel(0.0, 0.00000005)
 
-    adc = AnalogToDigitalConverter(-0.001, 0.001, 16)
-    dac = DigitalToAnalogConverter(-0.001, 0.001, 128)
-    sensor_converters = [adc]#, dac]
+    digital_resolution = 16
+    adc = AnalogToDigitalConverter(-0.001, 0.001, digital_resolution)
+    dac = DigitalToAnalogConverter(-0.001, 0.001, digital_resolution)
+    sensor_converters = [adc, dac]
 
     sensors = [
         Sensor(
@@ -390,42 +450,24 @@ def main():
     )
 
     correlator = SimpleCorrelator(
-        sample_rate=controller.sample_rate*len(sensors), 
+        sample_rate=controller.sample_rate, 
+        shot_detector=SimpleFirstShotDetector(), 
     )
 
     sim_time = 2.3
 
     while controller._time < sim_time:
         controller.update_buffers()
-        offsets = correlator.get_buffer_offsets(controller.buffers)
+        offsets = correlator.get_buffer_offsets(controller.get_buffers())
         print(offsets)
         
-        # _times = []
-        # for buffer in controller.buffers:
-        #     _times += [meas.time for meas in buffer]
-        # resampled_times = sorted( _times )[len(sensors)-1:]
-        # resampled_buffers = upsample_simultaneous_signals(correlator.clean_buffers)
-        # for resampled_buffer in resampled_buffers:
-        #     plt.plot(resampled_times, resampled_buffer, "-")
-        # for buffer, clean_buffer in zip(controller.buffers, correlator.clean_buffers):
-        #     plt.plot([meas.time for meas in buffer], clean_buffer, "o")
-        # plt.show()
-        # plot_clean_buffers(
-        #     [
-        #         [meas.time for meas in buffer]
-        #         for buffer in controller.buffers
-        #     ], 
-        #     [
-        #         [meas.value for meas in buffer]
-        #         for buffer in controller.buffers
-        #     ], 
-        # )
-        plot_clean_buffers(
-            correlator.clean_buffer_times, 
-            correlator.clean_buffers, 
-            correlator.buffer_maxes, 
+        fig, ax = plt.subplots()
+        plot_buffers(ax, correlator.buffers)
+        plot_buffer_maxes(ax, correlator.max_times)
+        plot_buffer_offsets(
+            ax, 
+            correlator.max_times[correlator.first_buffer_ind], 
             offsets, 
-            correlator.first_buffer_ind, 
         )
         plt.show()
 
