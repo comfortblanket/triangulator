@@ -1,6 +1,10 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.io import wavfile
 
+######################################################################
+# Noise Models
+#  - Implement a noise() method which returns a noise value
 
 class GaussianNoiseModel:
     def __init__(self, mean, std_dev):
@@ -10,11 +14,24 @@ class GaussianNoiseModel:
     def noise(self):
         return np.random.normal(self.mean, self.std_dev)
 
+######################################################################
+# Decay Models
+#  - Implement a decay(signal, dist) method which returns a value 
+#       signal decayed over a distance of dist
+
+class ZeroDecayModel:
+    def decay(self, signal, dist):
+        return signal
+
 
 class R3DecayModel:
     def decay(self, signal, dist):
         return signal / dist**3
 
+######################################################################
+# Event Models
+#  - Implement an amplitude(time) method which returns a signal 
+#       amplitude value at the given time
 
 class SimpleEvent:
     def __init__(self, position, start_time, stop_time, max_amp, frequency):
@@ -55,16 +72,77 @@ class SimplestEvent:
         return amp
 
 
+class WavFileEvent:
+    def __init__(self, position, start_time, fname):
+        self.position = position
+        self.start_time = start_time
+        self.fname = fname
+
+        # https://docs.scipy.org/doc/scipy/reference/generated/scipy.io.wavfile.read.html
+        self.sample_rate, self.data = wavfile.read(self.fname)
+        self.duration = self.data.shape[0] / self.sample_rate
+        self.stop_time = self.start_time + self.duration
+    
+    def amplitude(self, time):
+        amp = 0.0
+
+        if self.start_time <= time <= self.stop_time:
+            evt_time = time - self.start_time
+            amp = self.data[int(evt_time * self.sample_rate + 0.5)]
+        
+        return amp
+
+######################################################################
+# Converters
+#  - Implement a convert(value) method which performs some conversion operation
+
+class AnalogToDigitalConverter:
+    # Simply scales a value from the given analog range to the given digital 
+    # resolution. Ie. if the analog range is [-1, 1] and the digital 
+    # resolution is 1024, then a value of 0.25 will be converted to 256.
+
+    def __init__(self, analog_min, analog_max, digital_resolution=1024):
+        self.analog_min = analog_min
+        self.analog_max = analog_max
+        self.digital_resolution = digital_resolution
+    
+    def convert(self, value):
+        # Returns the digitized value of the given value
+        digitized_value = (value - self.analog_min) / (self.analog_max - self.analog_min) * self.digital_resolution
+        digitized_value = int(digitized_value)
+        digitized_value = max(0, min(self.digital_resolution, digitized_value))
+        return digitized_value
+
+
+class DigitalToAnalogConverter:
+    # Simply scales a value from the given digital resolution to the given 
+    # analog range. Ie. if the analog range is [-1, 1] and the digital 
+    # resolution is 1024, then a value of 256 will be converted to 0.25.
+    
+    def __init__(self, analog_min, analog_max, digital_resolution=1024):
+        self.analog_min = analog_min
+        self.analog_max = analog_max
+        self.digital_resolution = digital_resolution
+    
+    def convert(self, value):
+        # Returns the analog value of the given digitized value
+        analog_value = value * (self.analog_max - self.analog_min) / self.digital_resolution + self.analog_min
+        return analog_value
+
+######################################################################
+
 class World:
+    # Represents the physical world in which events occur and are measured
+
     def __init__(self, wave_speed, background_noise_model, decay_model, events):
         self.wave_speed = wave_speed
         self.background_noise_model = background_noise_model
         self.decay_model = decay_model
         self.events = events
     
-    def propagate(self, time, dist, event):
-        # Returns the amplitude of an event at the given time and distance 
-        # from it
+    def propagate(self, time, position, event):
+        # Returns the amplitude of an event at the given time and location
+        dist = np.linalg.norm(position - event.position)
         time_delay = dist / self.wave_speed
         amp = event.amplitude(time - time_delay)
         amp = self.decay_model.decay(amp, dist)
@@ -76,12 +154,19 @@ class World:
         # time and position
         total_amp = 0.0
         for event in self.events:
-            dist = np.linalg.norm(position - event.position)
-            total_amp += self.propagate(time, dist, event)
+            total_amp += self.propagate(time, position, event)
         return total_amp
+    
+    def get_wave_speed(self):
+        return self.wave_speed
 
 
 class SensorMeasurement:
+    # Represents a single measurement from a sensor at a given time and 
+    # position. Currently, the position is always the same as the sensor, but 
+    # it's included separately in case I want to allow sensors to move over 
+    # time.
+
     def __init__(self, position, time, value, sensor):
         self.position = position
         self.time = time
@@ -97,10 +182,14 @@ class Sensor:
         self.world = world
         self.position = position
         self.noise_model = noise_model
+
+        # Converters are applied in order to each measurement as it is made, 
+        # via the converters' convert() methods
         self.converters = converters
 
     def measure(self, time):
         # Returns a SensorMeasurement from this sensor at the given time
+
         amp = self.world.sample(time, self.position)
         noise = self.noise_model.noise()
         measurement = amp + noise
@@ -109,34 +198,25 @@ class Sensor:
         return SensorMeasurement(self.position, time, measurement, self)
 
 
-class AnalogToDigitalConverter:
-    def __init__(self, analog_min, analog_max, digital_resolution=1024):
-        self.analog_min = analog_min
-        self.analog_max = analog_max
-        self.digital_resolution = digital_resolution
-    
-    def convert(self, value):
-        # Returns the digitized value of the given value
-        digitized_value = (value - self.analog_min) / (self.analog_max - self.analog_min) * self.digital_resolution
-        digitized_value = int(digitized_value)
-        digitized_value = max(0, min(self.digital_resolution, digitized_value))
-        return digitized_value
-
-
-class DigitalToAnalogConverter:
-    def __init__(self, analog_min, analog_max, digital_resolution=1024):
-        self.analog_min = analog_min
-        self.analog_max = analog_max
-        self.digital_resolution = digital_resolution
-    
-    def convert(self, value):
-        # Returns the analog value of the given digitized value
-        analog_value = value * (self.analog_max - self.analog_min) / self.digital_resolution + self.analog_min
-        return analog_value
-
-
 class TimeDataBuffer:
+    # Represents a buffer of time-domain data, ie. a list of time values and a 
+    # corresponding list of data values. The time values must be evenly spaced.
+
     def __init__(self, times, values, sample_rate=None, original_measurements=None):
+        # values is a numpy array.
+        # 
+        # If times is a single value, it is assumed to be the start time and 
+        # the times are generated from it using the sample rate and the length 
+        # of the values array. (So sample_rate must be given.)
+        # 
+        # Otherwise, times may be a numpy array of the same lenth as values. 
+        # In this case, sample_rate is optional and if not given, it will be 
+        # calculated from the times array. In either case, it must satisfy the 
+        # np.allclose() function that the times differ by approx its value.
+        # 
+        # original_measurements is an optional list of SensorMeasurement 
+        # objects which may be used to keep track of where the data came from.
+
         try:
             assert len(times) == len(values)
         except TypeError:
@@ -145,14 +225,28 @@ class TimeDataBuffer:
         self.times = times
         self.values = values
 
+        # Cached absolute values of the data, computed on demand
+        self.abs_values = None
+
         self.sample_rate = sample_rate
         if sample_rate is None:
             sample_rate = times[1] - times[0]
-        assert np.allclose(np.diff(times), sample_rate), "Times must be evenly spaced at the given sample rate"
+        
+        assert np.allclose(np.diff(times), sample_rate), \
+            "Times must be evenly spaced at the given sample rate"
 
         self.orig_meas = original_measurements
     
+    def abs(self):
+        # Returns the absolute values of the data values
+        if self.abs_values is None:
+            self.abs_values = np.abs(self.values)
+        return self.abs_values
+    
     def copy(self, times=None, values=None, sample_rate=None, orig_meas=None):
+        # Creates a copy of this TimeDataBuffer, optionally with some 
+        # parameters changed
+
         if times is None:
             times = self.times.copy()
         
@@ -169,6 +263,8 @@ class TimeDataBuffer:
 
     @classmethod
     def from_measurements(cls, measurements, sample_rate=None):
+        # Creates a TimeDataBuffer from a list of SensorMeasurement objects
+
         times = np.array([measurement.time for measurement in measurements])
         values = np.array([measurement.value for measurement in measurements])
         return cls(times, values, sample_rate, measurements)
@@ -187,17 +283,35 @@ class TimeDataBuffer:
 
 
 class SimpleSensorController:
-    def __init__(self, sensors, sample_rate, inter_buffer_time, buffer_size, start_time=0.0, start_sensor_ind=0):
+    # Basic controller for a set of sensors. It coordinates measurements from 
+    # the sensors, keeping track of the time and sensor index as it goes.
+
+    def __init__(self, sensors, sample_rate, inter_buffer_time, buffer_collection_size, start_time=0.0, start_sensor_ind=0):
+
+        # List of sensor objects
         self.sensors = sensors
+
+        # Rate at which measurements are made by the controller
         self.sample_rate = sample_rate
+
+        # Time between buffers (for simulating processing time)
         self.inter_buffer_time = inter_buffer_time
 
-        self.buffer_size = buffer_size
+        # Number of measurements collected during each buffer update, spread 
+        # evenly across all sensors (assuming it is evenly divisible by the 
+        # number of sensors)
+        self.buffer_collection_size = buffer_collection_size
+
+        # One list of measurements for each sensor
         self.buffers = [[] for _ in sensors]
         
+        # When to start collecting measurements
         self.start_time = start_time
+
+        # Which sensor to start collecting measurements from
         self.start_sensor_ind = start_sensor_ind
 
+        # Internal state variables
         self._time = start_time
         self._sensor_ind = start_sensor_ind
     
@@ -221,9 +335,14 @@ class SimpleSensorController:
         self._sensor_ind = self.start_sensor_ind
 
     def update_buffers(self):
+        # Collects measurements from each sensor and stores them in the 
+        # appropriate buffer. A total of buffer_collection_size measurements 
+        # are collected, and internal _time and _sensor_ind variables are 
+        # updated.
+
         self.buffers = [[] for _ in self.sensors]
 
-        for _ in range(self.buffer_size * len(self.sensors)):
+        for _ in range(self.buffer_collection_size):
             self.buffers[self._sensor_ind].append(
                 self.sensors[self._sensor_ind].measure(self._time)
             )
@@ -234,9 +353,11 @@ class SimpleSensorController:
         self.reset_sensor_ind()
     
     def get_effective_sample_rate(self):
+        # Gets the sample rate of the individual buffers
         return self.sample_rate * len(self.sensors)
     
     def get_buffers(self):
+        # Returns the buffers as a list of TimeDataBuffer objects
         return [
             TimeDataBuffer.from_measurements(
                 buffer, 
@@ -247,47 +368,23 @@ class SimpleSensorController:
 
 
 class SimpleFirstShotDetector:
+
     def __init__(self, basic_snr=1.5):
         self.basic_snr = basic_snr
-        self.abs_buffer_values = []
-        self.buffer_abs_argmaxes = []
-        self.buffer_abs_maxes = []
-        self.buffer_abs_medians = []
     
     def detect(self, buffers):
-        self.abs_buffer_values = [
-            np.abs(buffer.values) 
-            for buffer in buffers
-        ]
-        self.buffer_abs_argmaxes = [
-            np.argmax(abs_buffer_values) 
-            for abs_buffer_values in self.abs_buffer_values
-        ]
-        self.buffer_abs_maxes = [
-            abs_buffer_values[abs_argmax] 
-            for abs_buffer_values, abs_argmax 
-            in zip(self.abs_buffer_values, self.buffer_abs_argmaxes)
-        ]
-        self.buffer_abs_medians = [
-            np.median(abs_buffer_values) 
-            for abs_buffer_values in self.abs_buffer_values
-        ]
-        return all([
-            abs_max > self.basic_snr * abs_median
-            for abs_max, abs_median
-            in zip(self.buffer_abs_maxes, self.buffer_abs_medians)
+        # Returns a numpy array of indices into each buffer where a shot is 
+        # detected, one for each buffer. If no shot is detected in a buffer, 
+        # the corresponding index is None.
+
+        # TODO
+
+        return np.array([
+            # THIS IS A NONSENSE EQUATION FOR NOW
+            int(27 * np.random.rand()) if np.random.rand() < 0.9 else np.nan
+            for buffer 
+            in buffers
         ])
-
-
-def normalize(data, largest_result=100.0, data_abs_max=None):
-
-    if data_abs_max is None:
-        abs_data = np.abs(data)
-        data_abs_max = np.max(abs_data)
-    
-    data = data * (largest_result / data_abs_max)
-
-    return data
 
 
 class SimpleCorrelator:
@@ -296,30 +393,24 @@ class SimpleCorrelator:
         self.shot_detector = shot_detector
 
         self.buffers = []
-        self.max_times = []
+        self.shot_times = []
         self.first_buffer_ind = None
 
     def get_buffer_offsets(self, time_data_buffers):
 
         self.buffers = time_data_buffers
-        
-        if not self.shot_detector.detect(self.buffers):
-            return None
-        
-        self.buffers = [
-            buffer.copy(values=normalize(buffer.values, data_abs_max=buffer_abs_max))
-            for buffer, buffer_abs_max in zip(self.buffers, self.shot_detector.buffer_abs_maxes)
-        ]
+        shot_inds = self.shot_detector.detect(self.buffers)
 
-        # Find the time of the max value in each buffer
-        self.max_inds = self.shot_detector.buffer_abs_argmaxes
-        self.max_times = np.array([
-            buffer.times[max_ind] 
-            for buffer, max_ind in zip(self.buffers, self.max_inds)
+        if np.isnan(shot_inds).any():
+            return None
+
+        self.shot_times = np.array([
+            buffer.times[shot_ind] 
+            for buffer, shot_ind in zip(self.buffers, shot_inds)
         ])
 
-        # Find the buffer with the first maximum
-        self.first_buffer_ind = np.argmin(self.max_times)
+        # Find the buffer with the first shot time
+        self.first_buffer_ind = np.argmin(shot_inds)
         first_buffer = self.buffers[self.first_buffer_ind]
 
         # Find the offsets of the other buffers relative to the 'first' buffer 
@@ -348,7 +439,7 @@ class SimpleFarFieldDirectionFinder:
                 sensor_angle = np.arctan2(sensor_pos_diff[1], sensor_pos_diff[0])
                 
                 sensor_dist = np.linalg.norm(sensor_pos_diff)
-                tdoa_angle = np.arccos(time_offset * ref_sensor.world.wave_speed / sensor_dist)
+                tdoa_angle = np.arccos(time_offset * ref_sensor.world.get_wave_speed() / sensor_dist)
 
                 angles[i] = np.rad2deg(sensor_angle + tdoa_angle)
             else:
@@ -402,71 +493,40 @@ def main():
     np.random.seed(0)
 
     events = [
-        SimplestEvent(
-            position=np.array([1.0, 10.0]), 
-            start_time=1.0, 
-            stop_time=1.5, 
-            max_amp=1.0, 
-            frequency=127.0, 
+        WavFileEvent(
+            position=np.array([1.0, 1000.0]), 
+            start_time=-1.0, 
+            fname="three_shots_32pcm.wav", 
         ), 
     ]
 
     world = World(
         wave_speed=1114.0, 
-        # background_noise_model=GaussianNoiseModel(0.0, 0.0), 
-        background_noise_model=GaussianNoiseModel(0.0, 0.000001), 
-        decay_model=R3DecayModel(), 
+        background_noise_model=GaussianNoiseModel(0.0, 0.0), 
+        # background_noise_model=GaussianNoiseModel(0.0, 0.05), 
+        # decay_model=R3DecayModel(), 
+        decay_model=ZeroDecayModel(), 
         events=events, 
     )
 
-    sensor_noise = GaussianNoiseModel(0.0, 0.0)
-    # sensor_noise = GaussianNoiseModel(0.0, 0.00000005)
+    # sensor_noise = GaussianNoiseModel(0.0, 0.0)
+    sensor_noise = GaussianNoiseModel(0.0, 0.03)
 
     digital_resolution = 1024
-    adc = AnalogToDigitalConverter(-0.001, 0.001, digital_resolution)
-    dac = DigitalToAnalogConverter(-0.001, 0.001, digital_resolution)
+    adc = AnalogToDigitalConverter(-1.0, 1.0, digital_resolution)
+    dac = DigitalToAnalogConverter(-1.0, 1.0, digital_resolution)
     sensor_converters = [adc, dac]
 
     sensors = [
         Sensor(
             world=world, 
+            position=np.array([10.0, 10.0]), 
+            noise_model=sensor_noise, 
+            converters=sensor_converters, 
+        ), 
+        Sensor(
+            world=world, 
             position=np.array([1.0, 0.0]), 
-            noise_model=sensor_noise, 
-            converters=sensor_converters, 
-        ), 
-        Sensor(
-            world=world, 
-            position=np.array([3.0, 0.0]), 
-            noise_model=sensor_noise, 
-            converters=sensor_converters, 
-        ), 
-        Sensor(
-            world=world, 
-            position=np.array([5.0, 0.0]), 
-            noise_model=sensor_noise, 
-            converters=sensor_converters, 
-        ), 
-        Sensor(
-            world=world, 
-            position=np.array([7.0, 0.0]), 
-            noise_model=sensor_noise, 
-            converters=sensor_converters, 
-        ), 
-        Sensor(
-            world=world, 
-            position=np.array([9.0, 0.0]), 
-            noise_model=sensor_noise, 
-            converters=sensor_converters, 
-        ), 
-        Sensor(
-            world=world, 
-            position=np.array([11.0, 0.0]), 
-            noise_model=sensor_noise, 
-            converters=sensor_converters, 
-        ), 
-        Sensor(
-            world=world, 
-            position=np.array([13.0, 0.0]), 
             noise_model=sensor_noise, 
             converters=sensor_converters, 
         ), 
@@ -474,9 +534,9 @@ def main():
 
     controller = SimpleSensorController(
         sensors=sensors, 
-        sample_rate=1/5000.0, 
+        sample_rate=1/5000, 
         inter_buffer_time=0.0, 
-        buffer_size=10000, 
+        buffer_collection_size=5000, 
     )
 
     correlator = SimpleCorrelator(
@@ -486,26 +546,30 @@ def main():
 
     direction_finder = SimpleFarFieldDirectionFinder(controller)
 
-    sim_time = 2.3
+    sim_time = 13.0
 
+    step = 0
     while controller._time < sim_time:
         controller.update_buffers()
         offsets = correlator.get_buffer_offsets(controller.get_buffers())
-        print("Time offsets (seconds): {}".format(offsets))
+        print("[{}] Time offsets (seconds): {}".format(step, offsets))
 
         if offsets is not None:
             angle, angle_std = direction_finder.find_direction(offsets, correlator.first_buffer_ind)
-            print("Detected shot at {:.03f} deg (std: {:0.3g})".format(angle, angle_std))
+            print("    Detected shot at {:.03f} deg (std: {:0.3g})".format(angle, angle_std))
         
         fig, ax = plt.subplots()
         plot_buffers(ax, correlator.buffers)
-        plot_buffer_maxes(ax, correlator.max_times)
-        plot_buffer_offsets(
-            ax, 
-            correlator.max_times[correlator.first_buffer_ind], 
-            offsets, 
-        )
-        plt.show()
+        if offsets is not None:
+            plot_buffer_maxes(ax, correlator.shot_times)
+            plot_buffer_offsets(
+                ax, 
+                correlator.shot_times[correlator.first_buffer_ind], 
+                offsets, 
+            )
+        # plt.show()
+        fig.savefig("sim_{:02d}.png".format(step))
+        step += 1
 
 
 if __name__ == "__main__":
