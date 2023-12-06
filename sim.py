@@ -367,6 +367,189 @@ class SimpleSensorController:
         ]
 
 
+class SlidingCFARController:
+
+    def __init__(self, sensors, cfar_detectors, sample_rate, start_time=0.0, start_sensor_ind=0):
+
+        # List of sensor objects and associated CFAR detectors
+        self.sensors = sensors
+        self.cfar_detectors = cfar_detectors
+        assert len(sensors) == len(cfar_detectors)
+
+        # Rate at which measurements are made by the controller
+        self.sample_rate = sample_rate
+        
+        # When to start collecting measurements
+        self.start_time = start_time
+
+        # Which sensor to start collecting measurements from
+        self.start_sensor_ind = start_sensor_ind
+
+        # Internal state variables
+        self._time = start_time
+        self._sensor_ind = start_sensor_ind
+    
+    def increment_time(self, inc_time=None):
+        # Increments the time by inc_time, or by the sample rate if inc_time 
+        # is None
+        if inc_time is None:
+            self._time += self.sample_rate
+        else:
+            self._time += inc_time
+    
+    def increment_sensor_ind(self, inc_sensor_ind=None):
+        # Increments the sensor index by inc_sensor_ind, or by 1 if 
+        # inc_sensor_ind is None
+        if inc_sensor_ind is None:
+            self._sensor_ind = int( (self._sensor_ind + 1) % len(self.sensors) )
+        else:
+            self._sensor_ind = int( (self._sensor_ind + inc_sensor_ind) % len(self.sensors) )
+    
+    def reset_sensor_ind(self):
+        self._sensor_ind = self.start_sensor_ind
+
+    def update(self):
+        measurement = self.sensors[self._sensor_ind].measure(self._time)
+        detected = self.cfar_detectors[self._sensor_ind].update(abs(measurement.value))
+        self.increment_time()
+        self.increment_sensor_ind()
+        return detected
+    
+    def get_effective_sample_rate(self):
+        # Gets the sample rate of the individual buffers
+        return self.sample_rate * len(self.sensors)
+    
+    def get_buffers(self):
+        # Returns the buffers as a list of TimeDataBuffer objects
+        sample_rate = self.get_effective_sample_rate()
+        return [
+            detector.get_buffer(
+                self._time - sample_rate * detector.get_buffer_length(), 
+                sample_rate, 
+            ) 
+            for detector in self.cfar_detectors
+        ]
+
+
+class SlidingCFARShotDetector:
+    def __init__(self, num_train, num_guard, num_test, num_done, false_alarm_rate):
+        # Newest cells -------------> Time --------------> Oldest cells
+        # |--------------|----------|-----------|---------------------|
+        # |<- num_done ->|<- test ->|<- guard ->|<- num_train cells ->|
+        #                |------------------ Buffer ------------------|
+        #                0 1 2 3 4 5 6 7 8 9 10 11... (buffer indices)
+        # 
+        # Train cells are used to estimate the noise level.
+        # Guard cells are ignored to avoid biasing the noise estimate.
+        # Reference cells are used to estimate the noise level.
+        self.num_train = num_train
+        self.num_guard = num_guard
+        self.num_test = num_test
+
+        # Number of sequential cells which must fall back under the threshold 
+        # before we consider a peak to be done
+        self.num_done = num_done
+        self._done_counts = num_done  # Delay start of detection
+
+        # Threshold factor
+        self.false_alarm_rate = false_alarm_rate
+        self._alpha = num_train * (false_alarm_rate**( -1.0/num_train ) - 1)
+
+        self._buffer = np.zeros(num_train + num_guard + num_test)
+        self._last_buffer_pos = len(self._buffer) - 1
+        
+        # _buffer_ind points to the newest cell in the buffer. We could slide 
+        # the whole buffer, but for efficiency's sake (especially since this 
+        # might be transfered to another language), we just keep track of the 
+        # start index. Not going to worry about number of cells filled, since 
+        # we'll just use the whole buffer all the time.
+        self._buffer_ind = -1
+
+        # These indices each point to the newest cell in their regions
+        self._train_ind = num_train - 1
+        self._guard_ind = num_train + num_guard - 1
+
+        self._train_mean = 0.0
+        self._guard_mean = 0.0
+        self._test_mean = 0.0
+
+        # # This is a dynamic list of pairs of indices (in lists) which track 
+        # # the start and end of each peak as they are detected. These are 
+        # # subtracted out of the train cells. As the end of the buffer 
+        # # overwrites these ranges, they are removed from the list.
+        # self._nulls = []
+
+        self._detection_inds = []
+    
+    def _incr_index(self, index):
+        if index >= self._last_buffer_pos:
+            return 0
+        return index + 1
+    
+    def get_buffer(self, start_time, sample_rate):
+        buffer_end = self._incr_index(self._buffer_ind)
+        return TimeDataBuffer(
+            np.arange(start_time, start_time+sample_rate*len(self._buffer), sample_rate)[:len(self._buffer)], 
+            np.concatenate((self._buffer[buffer_end:], self._buffer[:buffer_end])), 
+            sample_rate, 
+        )
+    
+    def get_buffer_length(self):
+        return len(self._buffer)
+
+    def update(self, value):
+        # Note value should probably be passed as the absolute value
+
+        last_ind = self._incr_index(self._buffer_ind)
+        last_value = self._buffer[last_ind]
+
+        self._buffer_ind = last_ind
+        self._buffer[self._buffer_ind] = value
+
+        if self._detection_inds and self._detection_inds[0] == self._buffer_ind:
+            self._detection_inds.pop(0)
+
+        # if self._nulls:
+        #     if self._nulls[0][0] == last_ind:
+        #         self._train_sum
+
+        self._guard_ind = self._incr_index(self._guard_ind)
+        guard_value = self._buffer[self._guard_ind]
+
+        self._train_ind = self._incr_index(self._train_ind)
+        train_value = self._buffer[self._train_ind]
+
+        self._test_mean += (value - guard_value) / self.num_test
+        self._guard_mean += (guard_value - train_value) / self.num_guard
+        self._train_mean += (train_value - last_value) / self.num_train
+
+        threshold = self._alpha * self._train_mean
+        detected = False
+
+        if self._done_counts > 0:
+            if self._test_mean < threshold:
+                self._done_counts -= 1
+            else:
+                self._done_counts = self.num_done
+
+        elif self._test_mean > threshold:
+            self._detection_inds.append(self._buffer_ind)
+            detected = True
+            self._done_counts = self.num_done
+        
+        return detected
+    
+    def get_detection_offsets(self):
+        return np.array([
+            (
+                self._buffer_ind - detection_ind 
+                if detection_ind <= self._buffer_ind 
+                else self._buffer_ind - detection_ind + self._last_buffer_pos + 1
+            )
+            for detection_ind in self._detection_inds
+        ])
+
+
 class SimpleFirstShotDetector:
 
     def __init__(self, basic_snr=1.5):
@@ -377,6 +560,8 @@ class SimpleFirstShotDetector:
         # detected, one for each buffer. If no shot is detected in a buffer, 
         # the corresponding index is None.
 
+        # For each buffer, find the first index where the absolute value of
+        # the signal is greater than the basic_snr times ...
         # TODO
 
         return np.array([
@@ -531,45 +716,78 @@ def main():
             converters=sensor_converters, 
         ), 
     ]
+    cfar_detectors = [
+        SlidingCFARShotDetector(
+            num_train=150, 
+            num_guard=20, 
+            num_test=3, 
+            num_done=10, 
+            false_alarm_rate=1e-3, 
+        ), 
+        SlidingCFARShotDetector(
+            num_train=150, 
+            num_guard=20, 
+            num_test=3, 
+            num_done=10, 
+            false_alarm_rate=1e-3, 
+        ), 
+    ]
 
-    controller = SimpleSensorController(
+    # controller = SimpleSensorController(
+    #     sensors=sensors, 
+    #     sample_rate=1/5000, 
+    #     inter_buffer_time=0.0, 
+    #     buffer_collection_size=5000, 
+    # )
+    controller = SlidingCFARController(
         sensors=sensors, 
+        cfar_detectors=cfar_detectors, 
         sample_rate=1/5000, 
-        inter_buffer_time=0.0, 
-        buffer_collection_size=5000, 
     )
 
-    correlator = SimpleCorrelator(
-        sample_rate=controller.sample_rate, 
-        shot_detector=SimpleFirstShotDetector(), 
-    )
+    # correlator = SimpleCorrelator(
+    #     sample_rate=controller.sample_rate, 
+    #     shot_detector=SimpleFirstShotDetector(), 
+    # )
 
     direction_finder = SimpleFarFieldDirectionFinder(controller)
 
     sim_time = 13.0
 
-    step = 0
-    while controller._time < sim_time:
-        controller.update_buffers()
-        offsets = correlator.get_buffer_offsets(controller.get_buffers())
-        print("[{}] Time offsets (seconds): {}".format(step, offsets))
+    # step = 0
+    # while controller._time < sim_time:
+    #     controller.update_buffers()
+    #     offsets = correlator.get_buffer_offsets(controller.get_buffers())
+    #     print("[{}] Time offsets (seconds): {}".format(step, offsets))
 
-        if offsets is not None:
-            angle, angle_std = direction_finder.find_direction(offsets, correlator.first_buffer_ind)
-            print("    Detected shot at {:.03f} deg (std: {:0.3g})".format(angle, angle_std))
+    #     if offsets is not None:
+    #         angle, angle_std = direction_finder.find_direction(offsets, correlator.first_buffer_ind)
+    #         print("    Detected shot at {:.03f} deg (std: {:0.3g})".format(angle, angle_std))
         
-        fig, ax = plt.subplots()
-        plot_buffers(ax, correlator.buffers)
-        if offsets is not None:
-            plot_buffer_maxes(ax, correlator.shot_times)
-            plot_buffer_offsets(
-                ax, 
-                correlator.shot_times[correlator.first_buffer_ind], 
-                offsets, 
-            )
-        # plt.show()
-        fig.savefig("sim_{:02d}.png".format(step))
-        step += 1
+    #     fig, ax = plt.subplots()
+    #     plot_buffers(ax, correlator.buffers)
+    #     if offsets is not None:
+    #         plot_buffer_maxes(ax, correlator.shot_times)
+    #         plot_buffer_offsets(
+    #             ax, 
+    #             correlator.shot_times[correlator.first_buffer_ind], 
+    #             offsets, 
+    #         )
+    #     # plt.show()
+    #     fig.savefig("sim_{:02d}.png".format(step))
+    #     step += 1
+    while controller._time < sim_time:
+        detected = controller.update()
+
+        if detected:
+            print("Detected shot")
+            fig, ax = plt.subplots()
+            plot_buffers(ax, controller.get_buffers())
+            plt.show()
+    
+    fig, ax = plt.subplots()
+    plot_buffers(ax, controller.get_buffers())
+    plt.show()
 
 
 if __name__ == "__main__":
