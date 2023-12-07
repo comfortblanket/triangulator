@@ -73,6 +73,8 @@ class SimplestEvent:
 
 
 class WavFileEvent:
+    # TODO: Deal with stereo files
+
     def __init__(self, position, start_time, fname):
         self.position = position
         self.start_time = start_time
@@ -86,9 +88,9 @@ class WavFileEvent:
     def amplitude(self, time):
         amp = 0.0
 
-        if self.start_time <= time <= self.stop_time:
+        if self.start_time <= time < self.stop_time:
             evt_time = time - self.start_time
-            amp = self.data[int(evt_time * self.sample_rate + 0.5)]
+            amp = self.data[int(evt_time * self.sample_rate)]
         
         return amp
 
@@ -129,53 +131,16 @@ class DigitalToAnalogConverter:
         analog_value = value * (self.analog_max - self.analog_min) / self.digital_resolution + self.analog_min
         return analog_value
 
+
+class AbsValConverter:
+    def convert(self, value):
+        return abs(value)
+
 ######################################################################
-
-class World:
-    # Represents the physical world in which events occur and are measured
-
-    def __init__(self, wave_speed, background_noise_model, decay_model, events):
-        self.wave_speed = wave_speed
-        self.background_noise_model = background_noise_model
-        self.decay_model = decay_model
-        self.events = events
-    
-    def propagate(self, time, position, event):
-        # Returns the amplitude of an event at the given time and location
-        dist = np.linalg.norm(position - event.position)
-        time_delay = dist / self.wave_speed
-        amp = event.amplitude(time - time_delay)
-        amp = self.decay_model.decay(amp, dist)
-        noise = self.background_noise_model.noise()
-        return amp + noise
-    
-    def sample(self, time, position):
-        # Returns the total propagated amplitude of all events at the given 
-        # time and position
-        total_amp = 0.0
-        for event in self.events:
-            total_amp += self.propagate(time, position, event)
-        return total_amp
-    
-    def get_wave_speed(self):
-        return self.wave_speed
-
-
-class SensorMeasurement:
-    # Represents a single measurement from a sensor at a given time and 
-    # position. Currently, the position is always the same as the sensor, but 
-    # it's included separately in case I want to allow sensors to move over 
-    # time.
-
-    def __init__(self, position, time, value, sensor):
-        self.position = position
-        self.time = time
-        self.value = value
-        self.sensor = sensor
-    
-    def copy(self):
-        return SensorMeasurement(self.position, self.time, self.value, self.sensor)
-
+# Sensors
+#  - Implement a measure(time) method which returns a SensorMeasurement
+#  - Some sensors may have other specific methods which are used by other
+#       parts of the system
 
 class Sensor:
     def __init__(self, world, position, noise_model, converters=[]):
@@ -198,89 +163,59 @@ class Sensor:
         return SensorMeasurement(self.position, time, measurement, self)
 
 
-class TimeDataBuffer:
-    # Represents a buffer of time-domain data, ie. a list of time values and a 
-    # corresponding list of data values. The time values must be evenly spaced.
+class SlidingDetectionSensor:
+    # A sensor which passes its measurements through a detector as they are 
+    # made. The detector is updated with each measurement. This requires that 
+    # measurements be made at a constant rate.
 
-    def __init__(self, times, values, sample_rate=None, original_measurements=None):
-        # values is a numpy array.
-        # 
-        # If times is a single value, it is assumed to be the start time and 
-        # the times are generated from it using the sample rate and the length 
-        # of the values array. (So sample_rate must be given.)
-        # 
-        # Otherwise, times may be a numpy array of the same lenth as values. 
-        # In this case, sample_rate is optional and if not given, it will be 
-        # calculated from the times array. In either case, it must satisfy the 
-        # np.allclose() function that the times differ by approx its value.
-        # 
-        # original_measurements is an optional list of SensorMeasurement 
-        # objects which may be used to keep track of where the data came from.
+    def __init__(self, world, position, noise_model, converters=[], detector_converters=[], detector=None):
+        self.world = world
+        self.position = position
+        self.noise_model = noise_model
 
-        try:
-            assert len(times) == len(values)
-        except TypeError:
-            times = np.arange(times, times + len(values) * sample_rate, sample_rate)
+        # Converters are applied in order to each measurement as it is made, 
+        # via the converters' convert() methods
+        self.converters = converters
+
+        # Detector converters are applied (via the converters' convert() 
+        # methods) in order to each measurement just before it is passed to 
+        # the detector, after the regular converters have been applied to it
+        self.detector_converters = detector_converters
+
+        # The detector must have an update(value) method which returns True if
+        # a shot was detected and False otherwise
+        self.detector = detector
+
+        # Whether the most recent measurement was detected as a shot
+        self._just_detected = False
+
+    def measure(self, time):
+        # Returns a SensorMeasurement from this sensor at the given time
+
+        amp = self.world.sample(time, self.position)
+        noise = self.noise_model.noise()
+        measurement = amp + noise
         
-        self.times = times
-        self.values = values
+        for converter in self.converters:
+            measurement = converter.convert(measurement)
 
-        # Cached absolute values of the data, computed on demand
-        self.abs_values = None
-
-        self.sample_rate = sample_rate
-        if sample_rate is None:
-            sample_rate = times[1] - times[0]
+        detector_measurement = measurement
+        for converter in self.detector_converters:
+            detector_measurement = converter.convert(detector_measurement)
         
-        assert np.allclose(np.diff(times), sample_rate), \
-            "Times must be evenly spaced at the given sample rate"
-
-        self.orig_meas = original_measurements
+        self._just_detected = self.detector.update(detector_measurement)
+        return SensorMeasurement(self.position, time, measurement, self)
     
-    def abs(self):
-        # Returns the absolute values of the data values
-        if self.abs_values is None:
-            self.abs_values = np.abs(self.values)
-        return self.abs_values
-    
-    def copy(self, times=None, values=None, sample_rate=None, orig_meas=None):
-        # Creates a copy of this TimeDataBuffer, optionally with some 
-        # parameters changed
+    def just_detected(self):
+        return self._just_detected
 
-        if times is None:
-            times = self.times.copy()
-        
-        if values is None:
-            values = self.values.copy()
-        
-        if sample_rate is None:
-            sample_rate = self.sample_rate
-        
-        if orig_meas is None and self.orig_meas is not None:
-            orig_meas = [meas.copy() for meas in self.orig_meas]
-        
-        return TimeDataBuffer(times, values, sample_rate, orig_meas)
-
-    @classmethod
-    def from_measurements(cls, measurements, sample_rate=None):
-        # Creates a TimeDataBuffer from a list of SensorMeasurement objects
-
-        times = np.array([measurement.time for measurement in measurements])
-        values = np.array([measurement.value for measurement in measurements])
-        return cls(times, values, sample_rate, measurements)
-    
-    def __getitem__(self, index):
-        return SensorMeasurement(
-            None if self.orig_meas is None else self.orig_meas[index].position, 
-            self.times[index], 
-            self.values[index], 
-            None if self.orig_meas is None else self.orig_meas[index].sensor, 
-        )
-    
-    def __len__(self):
-        return len(self.times)
-
-
+######################################################################
+# Sensor Controllers
+#  - Implement an update_buffers() method
+#  - Implement a get_effective_sample_rate() method
+#  - Implement a get_buffers() method
+#  - Some controllers may have other specific methods which are used by
+#       other parts of the system
 
 class SimpleSensorController:
     # Basic controller for a set of sensors. It coordinates measurements from 
@@ -367,17 +302,50 @@ class SimpleSensorController:
         ]
 
 
-class SlidingCFARController:
+class SlidingBufferController:
 
-    def __init__(self, sensors, cfar_detectors, sample_rate, start_time=0.0, start_sensor_ind=0):
+    def __init__(
+                self, 
+                sensors, 
+                sample_rate, 
+                correlator, 
+                direction_finder, 
+                detection_delay=10, 
+                correlation_delay=50, 
+                correlation_lead_time=10, 
+                start_time=0.0, 
+                start_sensor_ind=0, 
+            ):
 
         # List of sensor objects and associated CFAR detectors
         self.sensors = sensors
-        self.cfar_detectors = cfar_detectors
-        assert len(sensors) == len(cfar_detectors)
 
         # Rate at which measurements are made by the controller
         self.sample_rate = sample_rate
+
+        self.correlator = correlator
+        self.direction_finder = direction_finder
+
+        # Max amount of time to wait after an initial detection for more 
+        # detections. If no further detections are made within this time, the 
+        # correlation is reset.
+        self.detection_delay = detection_delay
+
+        # Amount of updates to wait after a detection before correlating, to 
+        # make sure there is enough shot data to correlate
+        self.correlation_delay = correlation_delay
+
+        self._detection_timer = self.detection_delay + 1
+        self._correlate_timer = self.correlation_delay + 1
+
+        self.correlation_lead_time = correlation_lead_time
+
+        # Indices of sensors in the order they made detections for a given shot
+        self._sensor_detection_inds = []
+
+        self._shot_det_time = None
+        self._shot_angle = None
+        self._shot_angle_std = None
         
         # When to start collecting measurements
         self.start_time = start_time
@@ -409,26 +377,262 @@ class SlidingCFARController:
         self._sensor_ind = self.start_sensor_ind
 
     def update(self):
-        measurement = self.sensors[self._sensor_ind].measure(self._time)
-        detected = self.cfar_detectors[self._sensor_ind].update(abs(measurement.value))
+        self.sensors[self._sensor_ind].measure(self._time)
+
+        # print(self._sensor_detection_inds); fig, ax = plt.subplots(); plot_buffers(ax, self.get_buffers()); plot_buffer_maxes(ax, [self._time - self._correlate_timer * self.sample_rate]); plt.show()
+
+        if not self._sensor_detection_inds:
+            # No detections yet, so check for one
+
+            if self.sensors[self._sensor_ind].just_detected():
+                # First detection, start timers
+                self._sensor_detection_inds.append(self._sensor_ind)
+                self._detection_timer = 0
+                self._correlate_timer = 0
+        else:
+            # Already have a detection, so update timers
+            self._detection_timer += 1
+            self._correlate_timer += 1
+
+            if self.sensors[self._sensor_ind].just_detected() and self._sensor_ind not in self._sensor_detection_inds:
+                # Another sensor has detected, so add it to the list
+                self._sensor_detection_inds.append(self._sensor_ind)
+
+            if self._detection_timer == self.detection_delay and len(self._sensor_detection_inds) <= 1:
+                # Been too long without another detection so reset
+                self._sensor_detection_inds = []
+                self._detection_timer = self.detection_delay + 1
+                self._correlate_timer = self.correlation_delay + 1
+
+            elif self._correlate_timer == self.correlation_delay:
+                self._correlate()
+
+                # Reset the detection
+                self._sensor_detection_inds = []
+                self._detection_timer = self.detection_delay + 1
+                self._correlate_timer = self.correlation_delay + 1
+
         self.increment_time()
         self.increment_sensor_ind()
-        return detected
     
+    def _correlate(self):
+        self._shot_det_time = self._time - self._correlate_timer * self.sample_rate
+
+        adjusted_first_detection_ind = self._sensor_detection_inds[0]
+        for sensor_ind in range(min(len(self.sensors), self._sensor_detection_inds[0])):
+            if sensor_ind not in self._sensor_detection_inds[1:]:
+                adjusted_first_detection_ind -= 1
+
+        # Get relevant buffers
+        buffers = self.get_buffers(self.correlation_lead_time + self.correlation_delay)
+        buffers = [
+            buf 
+            for i, buf 
+            in enumerate(buffers)
+            if i in self._sensor_detection_inds
+        ]
+
+        # Correlate the buffers
+        time_offsets = self.correlator.get_buffer_offsets(
+            buffers, 
+            adjusted_first_detection_ind, 
+        )
+        
+        # Relevant sensor positions
+        sensor_positions = np.array([
+            sensor.position
+            for i, sensor
+            in enumerate(self.sensors)
+            if i in self._sensor_detection_inds
+        ])
+
+        # Find the direction
+        self._shot_angle, self._shot_angle_std = self.direction_finder.find_direction(
+            time_offsets, 
+            sensor_positions, 
+            adjusted_first_detection_ind, 
+        )
+
+    def clear_shot_detection(self):
+        self._shot_det_time = None
+        self._shot_angle = None
+        self._shot_angle_std = None
+
+    def get_detections(self):
+        return np.array([
+            sensor.just_detected() 
+            for sensor in self.sensors
+        ])
+    
+    def get_detection_ind(self):
+        ind = -1
+        for i, sensor in enumerate(self.sensors):
+            if sensor.just_detected():
+                ind = i
+                break
+        return ind
+    
+    def get_shot_angle(self):
+        return self._shot_det_time, self._shot_angle, self._shot_angle_std
+
     def get_effective_sample_rate(self):
         # Gets the sample rate of the individual buffers
         return self.sample_rate * len(self.sensors)
     
-    def get_buffers(self):
-        # Returns the buffers as a list of TimeDataBuffer objects
+    def get_buffers(self, size=0):
+        # Returns the buffers as a list of TimeDataBuffer objects. If size=0, 
+        # returns the whole buffers, otherwise returns the last size samples. 
+        # Behavior is undefined for size<0 or size>buffer_length.
         sample_rate = self.get_effective_sample_rate()
         return [
-            detector.get_buffer(
-                self._time - sample_rate * detector.get_buffer_length(), 
+            sensor.detector.get_buffer(
+                self._time - sample_rate * sensor.detector.get_buffer_length(), 
                 sample_rate, 
-            ) 
-            for detector in self.cfar_detectors
+            )[-size:]
+            for sensor in self.sensors
         ]
+
+######################################################################
+# Data representations
+
+class SensorMeasurement:
+    # Represents a single measurement from a sensor at a given time and 
+    # position. Currently, the position is always the same as the sensor, but 
+    # it's included separately in case I want to allow sensors to move over 
+    # time.
+
+    def __init__(self, position, time, value, sensor):
+        self.position = position
+        self.time = time
+        self.value = value
+        self.sensor = sensor
+    
+    def copy(self):
+        return SensorMeasurement(self.position, self.time, self.value, self.sensor)
+
+
+class TimeDataBuffer:
+    # Represents a buffer of time-domain data, ie. a list of time values and a 
+    # corresponding list of data values. The time values must be evenly spaced.
+
+    def __init__(self, times, values, sample_rate=None, original_measurements=None):
+        # values is a numpy array.
+        # 
+        # If times is a single value, it is assumed to be the start time and 
+        # the times are generated from it using the sample rate and the length 
+        # of the values array. (So sample_rate must be given.)
+        # 
+        # Otherwise, times may be a numpy array of the same lenth as values. 
+        # In this case, sample_rate is optional and if not given, it will be 
+        # calculated from the times array. In either case, it must satisfy the 
+        # np.allclose() function that the times differ by approx its value.
+        # 
+        # original_measurements is an optional list of SensorMeasurement 
+        # objects which may be used to keep track of where the data came from.
+
+        try:
+            assert len(times) == len(values)
+        except TypeError:
+            times = np.arange(times, times + len(values) * sample_rate, sample_rate)
+        
+        self.times = times
+        self.values = values
+
+        # Cached absolute values of the data, computed on demand
+        self.abs_values = None
+
+        self.sample_rate = sample_rate
+        if sample_rate is None:
+            sample_rate = times[1] - times[0]
+        
+        assert np.allclose(np.diff(times), sample_rate), \
+            "Times must be evenly spaced at the given sample rate"
+
+        self.orig_meas = original_measurements
+    
+    def abs(self):
+        # Returns the absolute values of the data values
+        if self.abs_values is None:
+            self.abs_values = np.abs(self.values)
+        return self.abs_values
+    
+    def copy(self, times=None, values=None, sample_rate=None, orig_meas=None):
+        # Creates a copy of this TimeDataBuffer, optionally with some 
+        # parameters changed
+
+        if times is None:
+            times = self.times.copy()
+        
+        if values is None:
+            values = self.values.copy()
+        
+        if sample_rate is None:
+            sample_rate = self.sample_rate
+        
+        if orig_meas is None and self.orig_meas is not None:
+            orig_meas = [meas.copy() for meas in self.orig_meas]
+        
+        return TimeDataBuffer(times, values, sample_rate, orig_meas)
+
+    @classmethod
+    def from_measurements(cls, measurements, sample_rate=None):
+        # Creates a TimeDataBuffer from a list of SensorMeasurement objects
+
+        times = np.array([measurement.time for measurement in measurements])
+        values = np.array([measurement.value for measurement in measurements])
+        return cls(times, values, sample_rate, measurements)
+    
+    def get(self, index):
+        return SensorMeasurement(
+            None if self.orig_meas is None else self.orig_meas[index].position, 
+            self.times[index], 
+            self.values[index], 
+            None if self.orig_meas is None else self.orig_meas[index].sensor, 
+        )
+    
+    def __getitem__(self, index):
+        # Expected to be used with a slice object, other uses are undefined
+        times = self.times[index]
+        values = self.values[index]
+        sample_rate = self.sample_rate
+        orig_meas = None
+        if self.orig_meas is not None:
+            orig_meas = [meas.copy() for meas in self.orig_meas[index]]
+        return TimeDataBuffer(times, values, sample_rate, orig_meas)
+    
+    def __len__(self):
+        return len(self.times)
+
+######################################################################
+
+class World:
+    # Represents the physical world in which events occur and are measured
+
+    def __init__(self, wave_speed, background_noise_model, decay_model, events):
+        self.wave_speed = wave_speed
+        self.background_noise_model = background_noise_model
+        self.decay_model = decay_model
+        self.events = events
+    
+    def propagate(self, time, position, event):
+        # Returns the amplitude of an event at the given time and location
+        dist = np.linalg.norm(position - event.position)
+        time_delay = dist / self.wave_speed
+        amp = event.amplitude(time - time_delay)
+        amp = self.decay_model.decay(amp, dist)
+        noise = self.background_noise_model.noise()
+        return amp + noise
+    
+    def sample(self, time, position):
+        # Returns the total propagated amplitude of all events at the given 
+        # time and position
+        total_amp = 0.0
+        for event in self.events:
+            total_amp += self.propagate(time, position, event)
+        return total_amp
+    
+    def get_wave_speed(self):
+        return self.wave_speed
 
 
 class SlidingCFARShotDetector:
@@ -550,59 +754,27 @@ class SlidingCFARShotDetector:
         ])
 
 
-class SimpleFirstShotDetector:
-
-    def __init__(self, basic_snr=1.5):
-        self.basic_snr = basic_snr
-    
-    def detect(self, buffers):
-        # Returns a numpy array of indices into each buffer where a shot is 
-        # detected, one for each buffer. If no shot is detected in a buffer, 
-        # the corresponding index is None.
-
-        # For each buffer, find the first index where the absolute value of
-        # the signal is greater than the basic_snr times ...
-        # TODO
-
-        return np.array([
-            # THIS IS A NONSENSE EQUATION FOR NOW
-            int(27 * np.random.rand()) if np.random.rand() < 0.9 else np.nan
-            for buffer 
-            in buffers
-        ])
-
-
 class SimpleCorrelator:
-    def __init__(self, sample_rate, shot_detector):
+    def __init__(self, sample_rate):
         self.sample_rate = sample_rate
-        self.shot_detector = shot_detector
 
         self.buffers = []
         self.shot_times = []
-        self.first_buffer_ind = None
+        self.first_shot_buffer_ind = None
 
-    def get_buffer_offsets(self, time_data_buffers):
+    def get_buffer_offsets(self, time_data_buffers, first_shot_buffer_ind):
 
         self.buffers = time_data_buffers
-        shot_inds = self.shot_detector.detect(self.buffers)
-
-        if np.isnan(shot_inds).any():
-            return None
-
-        self.shot_times = np.array([
-            buffer.times[shot_ind] 
-            for buffer, shot_ind in zip(self.buffers, shot_inds)
-        ])
 
         # Find the buffer with the first shot time
-        self.first_buffer_ind = np.argmin(shot_inds)
-        first_buffer = self.buffers[self.first_buffer_ind]
+        self.first_shot_buffer_ind = first_shot_buffer_ind
+        first_buffer = self.buffers[self.first_shot_buffer_ind]
 
         # Find the offsets of the other buffers relative to the 'first' buffer 
         # by cross-correlating them
         offsets = np.zeros(len(self.buffers))
         for i, buffer in enumerate(self.buffers):
-            if i != self.first_buffer_ind:    
+            if i != self.first_shot_buffer_ind:    
                 best_ind = np.correlate(buffer.values, first_buffer.values, mode="full").argmax()
                 offsets[i] = (buffer.sample_rate / len(self.buffers)) * (best_ind - len(buffer))
         
@@ -610,21 +782,22 @@ class SimpleCorrelator:
 
 
 class SimpleFarFieldDirectionFinder:
-    def __init__(self, sensor_controller):
-        self.sensor_controller = sensor_controller
+    def __init__(self, world):
+        self.world = world
     
-    def find_direction(self, time_offsets, ref_ind):
+    def find_direction(self, time_offsets, sensor_positions, ref_ind):
+        assert len(time_offsets) == len(sensor_positions)
         angles = np.zeros(len(time_offsets))
-        ref_sensor = self.sensor_controller.sensors[ref_ind]
+        ref_sensor_pos = sensor_positions[ref_ind]
         for i, time_offset in enumerate(time_offsets):
             if i != ref_ind:
-                sensor = self.sensor_controller.sensors[i]
-                sensor_pos_diff = sensor.position - ref_sensor.position
+                sensor_pos = sensor_positions[i]
+                sensor_pos_diff = sensor_pos - ref_sensor_pos
 
                 sensor_angle = np.arctan2(sensor_pos_diff[1], sensor_pos_diff[0])
                 
                 sensor_dist = np.linalg.norm(sensor_pos_diff)
-                tdoa_angle = np.arccos(time_offset * ref_sensor.world.get_wave_speed() / sensor_dist)
+                tdoa_angle = np.arccos(time_offset * self.world.wave_speed / sensor_dist)
 
                 angles[i] = np.rad2deg(sensor_angle + tdoa_angle)
             else:
@@ -638,6 +811,8 @@ class SimpleFarFieldDirectionFinder:
         
         return angles_mean, angles_std
 
+######################################################################
+# Plotting functions
 
 def plot_buffers(
             ax, buffers, 
@@ -673,15 +848,18 @@ def plot_buffer_offsets(
         handles.append(handle)
     return handles
 
+######################################################################
+######################################################################
 
 def main():
     np.random.seed(0)
 
     events = [
         WavFileEvent(
-            position=np.array([1.0, 1000.0]), 
+            position=np.array([0.0, 1114.0]), 
             start_time=-1.0, 
             fname="three_shots_32pcm.wav", 
+            # fname="many_shots_low_snr_32pcm.wav", 
         ), 
     ]
 
@@ -702,93 +880,76 @@ def main():
     dac = DigitalToAnalogConverter(-1.0, 1.0, digital_resolution)
     sensor_converters = [adc, dac]
 
-    sensors = [
-        Sensor(
-            world=world, 
-            position=np.array([10.0, 10.0]), 
-            noise_model=sensor_noise, 
-            converters=sensor_converters, 
-        ), 
-        Sensor(
-            world=world, 
-            position=np.array([1.0, 0.0]), 
-            noise_model=sensor_noise, 
-            converters=sensor_converters, 
-        ), 
-    ]
-    cfar_detectors = [
-        SlidingCFARShotDetector(
-            num_train=150, 
-            num_guard=20, 
-            num_test=3, 
-            num_done=10, 
-            false_alarm_rate=1e-3, 
-        ), 
-        SlidingCFARShotDetector(
-            num_train=150, 
-            num_guard=20, 
-            num_test=3, 
-            num_done=10, 
-            false_alarm_rate=1e-3, 
-        ), 
-    ]
+    cfar_converters = [AbsValConverter()]
+    cfar_params = {
+        "num_train": 300, 
+        "num_guard": 30, 
+        "num_test": 10, 
+        "num_done": 10, 
+        "false_alarm_rate": 1e-2, 
+    }
 
-    # controller = SimpleSensorController(
-    #     sensors=sensors, 
-    #     sample_rate=1/5000, 
-    #     inter_buffer_time=0.0, 
-    #     buffer_collection_size=5000, 
-    # )
-    controller = SlidingCFARController(
+    sensors = [
+        SlidingDetectionSensor(
+            world=world, 
+            position=np.array([0.0, 0.0]), 
+            noise_model=sensor_noise, 
+            converters=sensor_converters, 
+            detector_converters=cfar_converters, 
+            detector=SlidingCFARShotDetector(**cfar_params), 
+        ), 
+        SlidingDetectionSensor(
+            world=world, 
+            position=np.array([-10.0, -5.0]), 
+            noise_model=sensor_noise, 
+            converters=sensor_converters, 
+            detector_converters=cfar_converters, 
+            detector=SlidingCFARShotDetector(**cfar_params), 
+        ), 
+        # SlidingDetectionSensor(
+        #     world=world, 
+        #     position=np.array([-5.0, -15.0]), 
+        #     noise_model=sensor_noise, 
+        #     converters=sensor_converters, 
+        #     detector_converters=cfar_converters, 
+        #     detector=SlidingCFARShotDetector(**cfar_params), 
+        # ), 
+        # SlidingDetectionSensor(
+        #     world=world, 
+        #     position=np.array([5.0, -10.0]), 
+        #     noise_model=sensor_noise, 
+        #     converters=sensor_converters, 
+        #     detector_converters=cfar_converters, 
+        #     detector=SlidingCFARShotDetector(**cfar_params), 
+        # ), 
+    ]
+    controller_sample_rate = 1./5000.
+
+    controller = SlidingBufferController(
         sensors=sensors, 
-        cfar_detectors=cfar_detectors, 
-        sample_rate=1/5000, 
+        sample_rate=controller_sample_rate, 
+        correlator=SimpleCorrelator(len(sensors) * controller_sample_rate), 
+        direction_finder=SimpleFarFieldDirectionFinder(world), 
+        detection_delay=80, 
+        correlation_delay=100, 
+        correlation_lead_time=30, 
     )
 
-    # correlator = SimpleCorrelator(
-    #     sample_rate=controller.sample_rate, 
-    #     shot_detector=SimpleFirstShotDetector(), 
-    # )
-
-    direction_finder = SimpleFarFieldDirectionFinder(controller)
-
-    sim_time = 13.0
-
-    # step = 0
-    # while controller._time < sim_time:
-    #     controller.update_buffers()
-    #     offsets = correlator.get_buffer_offsets(controller.get_buffers())
-    #     print("[{}] Time offsets (seconds): {}".format(step, offsets))
-
-    #     if offsets is not None:
-    #         angle, angle_std = direction_finder.find_direction(offsets, correlator.first_buffer_ind)
-    #         print("    Detected shot at {:.03f} deg (std: {:0.3g})".format(angle, angle_std))
-        
-    #     fig, ax = plt.subplots()
-    #     plot_buffers(ax, correlator.buffers)
-    #     if offsets is not None:
-    #         plot_buffer_maxes(ax, correlator.shot_times)
-    #         plot_buffer_offsets(
-    #             ax, 
-    #             correlator.shot_times[correlator.first_buffer_ind], 
-    #             offsets, 
-    #         )
-    #     # plt.show()
-    #     fig.savefig("sim_{:02d}.png".format(step))
-    #     step += 1
+    sim_time = 28.5
     while controller._time < sim_time:
-        detected = controller.update()
+        controller.update()
 
-        if detected:
-            print("Detected shot")
+        shot_time, shot_angle, shot_angle_std = controller.get_shot_angle()
+
+        if shot_time is not None:
+            print("Detected shot at t={:.3f} s, angle={:.3f} deg (std={:.4})".format(shot_time, shot_angle, shot_angle_std))
             fig, ax = plt.subplots()
             plot_buffers(ax, controller.get_buffers())
             plt.show()
-    
-    fig, ax = plt.subplots()
-    plot_buffers(ax, controller.get_buffers())
-    plt.show()
+            controller.clear_shot_detection()
 
+######################################################################
+######################################################################
 
 if __name__ == "__main__":
     main()
